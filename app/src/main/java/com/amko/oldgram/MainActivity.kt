@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -28,8 +29,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.amko.oldgram.ui.theme.OldgramTheme
 import java.io.ByteArrayInputStream
 
-private const val TAG_REQ = "OldgramREQ"
-private const val TAG_NET = "OldgramNET"
+private const val TAG_STORY = "OldgramSTORY"
 
 private const val BLOCK_PART = "/api/v1/discover/web/explore_grid/"
 
@@ -56,7 +56,6 @@ private const val NET_HOOK_JS = """
         try {
             var u = typeof input === 'string' ? input : input.url;
             if (shouldBlock(u, opts && opts.body)) {
-                OldgramBridge.log('BLOCKED fetch feed pagination');
                 return Promise.reject(new TypeError('blocked'));
             }
         } catch (e) {}
@@ -71,7 +70,6 @@ private const val NET_HOOK_JS = """
     XMLHttpRequest.prototype.send = function(b) {
         try {
             if (shouldBlock(this.__ogu, b)) {
-                OldgramBridge.log('BLOCKED xhr feed pagination');
                 this.abort();
                 return;
             }
@@ -81,28 +79,175 @@ private const val NET_HOOK_JS = """
 })();
 """
 
+private const val STORY_DEBUG_JS = """
+(function() {
+    if (window.__oldgramStoryDbg) { return; }
+    window.__oldgramStoryDbg = true;
+})();
+"""
+
 private const val FIX_JS = """
 (function() {
-    var h = window.innerHeight + 'px';
-    function apply() {
-        var b = document.body;
-        if (!b) { return; }
-        document.documentElement.style.setProperty('height', h, 'important');
-        b.style.setProperty('height', h, 'important');
-        var n = document.querySelector('.wbloks_88');
-        while (n && n !== b) {
+    if (window.__oldgramFix) { return; }
+    window.__oldgramFix = true;
+    var st = document.createElement('style');
+    st.textContent =
+        'video::-webkit-media-controls{display:none !important;}' +
+        'video::-webkit-media-controls-enclosure{display:none !important;}' +
+        'video::-webkit-media-controls-panel{display:none !important;}' +
+        'video::-webkit-media-controls-overlay-play-button{display:none !important;}' +
+        'video::-webkit-media-controls-start-playback-button{display:none !important;}';
+    document.head.appendChild(st);
+    function liftAll(start, h) {
+        var n = start;
+        while (n && n !== document.body) {
             n.style.setProperty('height', h, 'important');
             n.style.setProperty('min-height', h, 'important');
             n = n.parentElement;
         }
     }
-    if (window.__oldgramTimer) { clearInterval(window.__oldgramTimer); }
-    var t = 0;
-    window.__oldgramTimer = setInterval(function() {
-        apply();
-        t++;
-        if (t > 120) { clearInterval(window.__oldgramTimer); }
-    }, 250);
+    function liftZero(start, h) {
+        var n = start;
+        while (n && n !== document.body) {
+            if (n.getBoundingClientRect().height === 0) {
+                n.style.setProperty('height', h, 'important');
+                n.style.setProperty('min-height', h, 'important');
+            }
+            n = n.parentElement;
+        }
+    }
+    function findStory() {
+        var els = document.body.querySelectorAll('div');
+        for (var i = 0; i < els.length; i++) {
+            var e = els[i];
+            var r = e.getBoundingClientRect();
+            if (r.width < window.innerWidth * 0.9 || r.height < 300) { continue; }
+            if (r.top > -10) { continue; }
+            if (getComputedStyle(e).position !== 'absolute') { continue; }
+            return e;
+        }
+        return null;
+    }
+    function fixStory() {
+        var h = window.innerHeight + 'px';
+        var s = findStory();
+        if (!s) { return; }
+        liftZero(s.parentElement, h);
+        var r = s.getBoundingClientRect();
+        if (r.top < -10) {
+            var shift = (window.innerHeight - r.height) / 2 - r.top;
+            s.style.setProperty('transform', 'translateY(' + shift + 'px)', 'important');
+        }
+    }
+    function apply() {
+        var b = document.body;
+        if (!b) { return; }
+        var h = window.innerHeight + 'px';
+        var login = document.querySelector('.wbloks_88');
+        var onStory = location.pathname.indexOf('/stories/') === 0;
+        if (!login && !onStory) { return; }
+        document.documentElement.style.setProperty('height', h, 'important');
+        b.style.setProperty('height', h, 'important');
+        if (login) { liftAll(login, h); }
+        if (onStory) { fixStory(); }
+    }
+     var adLabels = [
+        'ad', 'ads', 'sponsored', 'reklama', 'oglas', 'sponzorirano', 'sponzorisano',
+        'anzeige', 'gesponsert', 'publicité', 'sponsorisé', 'anuncio', 'patrocinado',
+        'annuncio', 'sponsorizzato', 'advertentie', 'gesponsord', 'annons', 'sponsrad',
+        'reklam', 'sponsorlu'
+    ];
+    var adTries = 0;
+    var lastTry = 0;
+    var cover = null;
+    function removeCover() {
+        if (cover && cover.parentNode) { cover.parentNode.removeChild(cover); }
+        cover = null;
+    }
+    function showCover() {
+        if (cover || !document.body) { return; }
+        cover = document.createElement('div');
+        cover.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;background:#000;z-index:2147483647;pointer-events:none;';
+        document.body.appendChild(cover);
+    }
+    function topTexts() {
+        var out = [];
+        var els = document.body.querySelectorAll('span, div, a, h1, h2');
+        for (var i = 0; i < els.length && out.length < 12; i++) {
+            var e = els[i];
+            if (e.children.length > 0) { continue; }
+            var t = (e.textContent || '').trim();
+            if (t.length === 0 || t.length > 30) { continue; }
+            var r = e.getBoundingClientRect();
+            if (r.height > 0 && r.top >= 0 && r.top < window.innerHeight * 0.25) { out.push(t); }
+        }
+        return out;
+    }
+    function detectAd() {
+        var els = document.body.querySelectorAll('span, div, a');
+        for (var i = 0; i < els.length; i++) {
+            var e = els[i];
+            if (e.children.length > 0) { continue; }
+            var t = (e.textContent || '').trim().toLowerCase();
+            if (t.length === 0 || t.length > 20) { continue; }
+            if (adLabels.indexOf(t) === -1) { continue; }
+            var r = e.getBoundingClientRect();
+            if (r.height > 0 && r.top >= 0 && r.top < window.innerHeight * 0.25) { return e; }
+        }
+        return null;
+    }
+    function fire(target, type, x, y) {
+        var opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window };
+        var ev;
+        if (type.indexOf('pointer') === 0 && window.PointerEvent) {
+            ev = new PointerEvent(type, opts);
+        } else {
+            ev = new MouseEvent(type, opts);
+        }
+        target.dispatchEvent(ev);
+    }
+    function skipAd() {
+        var nb = document.querySelector('button[aria-label="Next"], [aria-label="Next"]');
+        if (nb) {
+            nb.click();
+            return 'button';
+        }
+        var x = window.innerWidth * 0.92;
+        var y = window.innerHeight * 0.4;
+        var t = document.elementFromPoint(x, y);
+        if (!t) { return 'none'; }
+        fire(t, 'pointerdown', x, y);
+        fire(t, 'mousedown', x, y);
+        fire(t, 'pointerup', x, y);
+        fire(t, 'mouseup', x, y);
+        fire(t, 'click', x, y);
+        return 'tap';
+    }
+    function checkAd() {
+        if (!document.body || location.pathname.indexOf('/stories/') !== 0) {
+            adTries = 0;
+            removeCover();
+            return;
+        }
+        var ad = detectAd();
+        if (!ad) {
+            adTries = 0;
+            removeCover();
+            return;
+        }
+        if (adTries >= 6) {
+            removeCover();
+            return;
+        }
+        showCover();
+        var now = Date.now();
+        if (now - lastTry < 800) { return; }
+        lastTry = now;
+        adTries++;
+        skipAd();
+    }
+    setInterval(checkAd, 250);
+    setInterval(apply, 300);
     apply();
 })();
 """
@@ -291,7 +436,7 @@ private const val HIDE_SUGGESTED_JS = """
 class NetBridge {
     @JavascriptInterface
     fun log(message: String) {
-        Log.e(TAG_NET, message)
+        Log.e(TAG_STORY, message)
     }
 }
 
@@ -348,6 +493,11 @@ fun InstagramWebView(modifier: Modifier = Modifier) {
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                 addJavascriptInterface(NetBridge(), "OldgramBridge")
+                webChromeClient = object : WebChromeClient() {
+                    override fun getDefaultVideoPoster(): Bitmap? {
+                        return Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+                    }
+                }
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(
                         view: WebView?,
@@ -363,7 +513,6 @@ fun InstagramWebView(modifier: Modifier = Modifier) {
                     ): WebResourceResponse? {
                         val url = request?.url?.toString() ?: return null
                         if (url.contains(BLOCK_PART)) {
-                            Log.e(TAG_REQ, "BLOCKED $url")
                             return WebResourceResponse(
                                 "application/json",
                                 "UTF-8",
@@ -383,6 +532,7 @@ fun InstagramWebView(modifier: Modifier = Modifier) {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         CookieManager.getInstance().flush()
                         view?.evaluateJavascript(NET_HOOK_JS, null)
+                        view?.evaluateJavascript(STORY_DEBUG_JS, null)
                         view?.evaluateJavascript(FIX_JS, null)
                         view?.evaluateJavascript(HIDE_REELS_JS, null)
                         view?.evaluateJavascript(HIDE_EXPLORE_JS, null)
@@ -391,6 +541,7 @@ fun InstagramWebView(modifier: Modifier = Modifier) {
                         view?.evaluateJavascript(HIDE_SUGGESTED_JS, null)
                         view?.postDelayed({
                             view.evaluateJavascript(NET_HOOK_JS, null)
+                            view.evaluateJavascript(STORY_DEBUG_JS, null)
                             view.evaluateJavascript(FIX_JS, null)
                             view.evaluateJavascript(HIDE_REELS_JS, null)
                             view.evaluateJavascript(HIDE_EXPLORE_JS, null)
